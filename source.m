@@ -152,7 +152,11 @@ classdef source < stochasticWave & hgsetget
                 end
                 magnitude = p.Results.magnitude;
                 nMag = length(magnitude);
-                obj( 1 , nObj , nHeight ) = source;
+                if strcmp(class(obj),'gpuSource')
+                    obj( 1 , nObj , nHeight ) = gpuSource;
+                else
+                    obj( 1 , nObj , nHeight ) = source;
+                end
                 for kObj = 1:nObj
                     for kHeight = 1:nHeight
                         obj(1,kObj,kHeight).p_zenith   = z(kObj);
@@ -522,6 +526,7 @@ classdef source < stochasticWave & hgsetget
                     out = bsxfun(@minus,s,s0);
                     out = 2*pi*out/obj.wavelength;
                     % 2\pi demodulation for a meamingfull phase
+%                     out = mod(out,2*pi);
                     %                     obj.wavefront = mod(obj.wavefront,2*pi);
                     %                     obj.wavefront = exp(1i.*2*pi*obj.wavefront/obj.wavelength)./s;
                 end
