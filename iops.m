@@ -32,10 +32,10 @@ classdef iops < hgsetget
        useJacket = false;
        
        %output coeficient paris normalised to the first
-       coefs;
-       inputCoefs; %reference coefs - generated from inputs
-       outputCoefs;
-       referenceCoefs; % reference coefs- ref to flat input wavefront
+       coefs; % coefs - calibrated and normalised coefficients of output
+       inputCoefs; % inputCoefs - how much light is coupled into each fibre
+       outputCoefs; % outputCoefs - how much light is at the output of each fibre
+       referenceCoefs; % referenceCoefs - normalised coefficients from a flat (0 segment piston) input
        
        % input and outputs
        inputE;
@@ -55,7 +55,6 @@ classdef iops < hgsetget
    properties (Dependent, SetObservable=true)
        % wavelength in um
        %wavelength;
-       
        
    end
    
@@ -87,7 +86,8 @@ classdef iops < hgsetget
        kx;
        ky;
        
-       
+       % initialised already?
+       init = false;
        
        % telescope segments
        segments;
@@ -101,8 +101,8 @@ classdef iops < hgsetget
        % Constructor
        function obj = iops(tel,wavelength,varargin)
            p = inputParser;
-           p.addParamValue('n', 1.58, @isnumeric);
-           p.addParamValue('deltaN', 0.025875, @isnumeric);
+           p.addParamValue('n', 1.46, @isnumeric);
+           p.addParamValue('deltaN',  0.02678, @isnumeric); %for 1550 nm  0.02678, for 1310 nm 0.025875
            p.addParamValue('sLength', 1e4, @isnumeric);
            p.addRequired('tel', @(x) isa(x,'telescopeAbstract'));
            p.addRequired('wavelength', @(x) isnumeric(x) || isa(x,'photometry') );
@@ -163,136 +163,13 @@ classdef iops < hgsetget
                fprintf('IOPS WARNING: Odd number of pixels in Telescope object, IOPS may not run');
            end
            
-           % set the x scale (obj.xs) using an image from a telescope
-           % segment and a gaussian of known width
-           
-           % padding for fft - image size matches physical object size
-           res = obj.tel.resolution*(4*0.2/obj.xs)+1; % nyquist sampling *2
-           
-           % pixel scale of tel
-           gmtPx = obj.tel.resolution/obj.tel.D; %GMT pixel scale, pix/m
-           
-           %create a circular pupil in the centre
-           [X Y] = meshgrid(-res/2:res/2-1,-res/2:res/2-1);
-           
-           segPupil1 = (hypot(X,Y) < obj.tel.segmentD*gmtPx/2) - (hypot(X,Y) < obj.tel.centralObscurationD*gmtPx/2);
-           
-           % create an image from this pupil
-           img = fftshift(fft2(segPupil1));
-           
-           % measure the width of this image
-           width = iops.gaussWidth(abs(img).^2);
-           
-           
-           % create a Gaussian of known width
-           [X Y] = meshgrid(-obj.resolution/2:obj.resolution/2-1);
-           inputWidth = 2;
-           inE = exp(-((X).*obj.xs/inputWidth).^2 - ((Y).*obj.xs/inputWidth).^2);
-           % measure the width of this Gaussian - in pixels
-           inWidth = iops.gaussWidth(abs(inE).^2);
-           
-           % match the pixel scale to the ratio of these two widths: this
-           % matches the image size of correct scale to the fibre size
-           obj.p_xs = obj.xs/(width/inWidth); % change the input scale depending on fwhm of image
-           
-           obj.xs = obj.p_xs;
-           
-           if obj.p_xs > 0.4
-               fprintf('IOPS WARNING: Simulation grid may be too coarse, consider decreasing xs for more accurate results\n');
-           end
-           
-           % create the fibre profile and mask for input
            obj.core = 4;
            obj.spacing = 8;
-           
-           obj.maskD = round(obj.core/obj.xs);
-           
-           
-           
-%            disk = fspecial('disk',obj.maskD/2);
-%            disk = disk./max(max(disk));
-           
-           
-           
-           % want the mask to have an odd number of pixels!!
-%            if ~rem(obj.maskD,2)
-%                obj.maskD = obj.maskD + 1; 
-%            end
-           
-           % fibre profile made of two discs of diameter core separated by spacing
-           obj.maskD = 2*round(obj.maskD/2) + 1; %use an odd number of pixels for the mask
-           disk=tools.piston(obj.maskD);
-           
-           obj.mask = zeros(obj.resolution);
-           
-           [sx sy] = size(disk);
-           
-           
-           % place the disk fibre profile on each side of centre.
-           % not using tools.piston with an offset here in case another
-           % profile is needed (eg fspecial('disk',obj.maskD/2); )
-           obj.mask(round(obj.resolution/2-sx/2:obj.resolution/2+sx/2-1),...
-                    round(obj.resolution/2-obj.spacing/2/obj.xs-sy/2:obj.resolution/2-obj.spacing/2/obj.xs+sy/2-1)) = disk;
-           % mask1 and mask2 are the mask for a single fibre
-           obj.mask1 = obj.mask;
-                
-           obj.mask(round(obj.resolution/2-sx/2:obj.resolution/2+sx/2-1),...
-                    round(obj.resolution/2+obj.spacing/2/obj.xs-sy/2:obj.resolution/2+obj.spacing/2/obj.xs+sy/2-1)) = disk;
-                
-           obj.mask2 = obj.mask - obj.mask1;
-           
-%            obj.mask1 = tools.piston(obj.core/obj.xs,obj.resolution,-obj.spacing/2/obj.xs,0,'type','double','shape','disc');
-%            obj.mask2 = tools.piston(obj.core/obj.xs,obj.resolution,obj.spacing/2/obj.xs,0,'type','double','shape','disc');
-%            obj.mask = obj.mask1+obj.mask2;
-           
-           % parameters for bpm
-           obj.index = zeros(obj.resolution,obj.resolution)+obj.mask.*obj.deltaN;
-           obj.index = obj.index+obj.n;
-           
-           
-           obj.F = (2*pi/obj.wavelength).*obj.index;% index profile
-           obj.D = obj.wavelength/(4*pi*obj.n);% diffraction coeff
-           obj.kx = [0:obj.resolution/2-1,(-obj.resolution/2):-1].*(2*pi/(obj.xs*obj.resolution));% Fourier space index - no fftshift required
-           obj.ky = [0:obj.resolution/2-1,(-obj.resolution/2):-1].*(2*pi/(obj.xs*obj.resolution));
-           % Fourier space diffraction - for BPM
-           obj.MD = zeros(obj.resolution,obj.resolution);
-           for kyi=1:obj.resolution
-                for kxi=1:obj.resolution
-                   obj.MD(kxi,kyi) = exp(-1i*obj.D*((obj.kx(kxi)^2)+(obj.ky(kyi)^2))*obj.zs);
-                 end
-           end
-           
-           
            obj.segments = tel.segment();
            
-           % coefs - calibrated and normalised coefficients of output
-           obj.coefs = zeros(2,length(obj.segPair));
-           % inputCoefs - how much light is coupled into each fibre
-           obj.inputCoefs = zeros(2,length(obj.segPair));
-           % outputCoefs - how much light is at the output of each fibre
-           obj.outputCoefs = zeros(2,length(obj.segPair));
-           % referenceCoefs - normalised coefficients from a flat (0
-           % segment piston) input
-           obj.referenceCoefs = zeros(2,length(obj.segPair));
-           
-           % complex amplitude of input and output
-           obj.inputE = zeros(obj.resolution,obj.resolution,length(obj.segPair));
-           obj.outputE = zeros(obj.resolution,obj.resolution,length(obj.segPair));
-           obj.unmaskedInput = zeros(obj.resolution,obj.resolution,length(obj.segPair)); % not multiplied by mask
-           
-           % generate reference coefs from flat input
-           
-           src = source('wavelength',photometry.J);
-           src=src.*tel.pupil;
-           
-           relay(obj,src);
-           
-           obj.referenceCoefs = obj.outputCoefs./obj.inputCoefs; %normalise reference coefficients to input
-           % reset other coefs
-           obj.coefs = zeros(2,length(obj.segPair));
-           obj.inputCoefs = zeros(2,length(obj.segPair));
-           obj.outputCoefs = zeros(2,length(obj.segPair));
-           
+           obj.initIOPS();
+           obj.init = true;
+
        end
 
        % Deconstructor
@@ -302,6 +179,18 @@ classdef iops < hgsetget
            end
        end
 
+       function initIOPS(obj)
+           %% initIOPS
+           % initialise everything for iops
+           obj.calibrateXS();
+           obj.createMask();
+           obj.initBPM();
+           obj.resetCoefs();
+           obj.resetReferenceCoefs();
+           obj.resetImages();
+           obj.calibrateReferenceCoefs();
+       end
+       
        function display(obj)
            %% DISPLAY Display object information
            %
@@ -358,7 +247,7 @@ classdef iops < hgsetget
            uE = zeros(res,res,length(obj.segPair));
            
            % _try_ to supress some oomao output!
-           ip.p_log.verbose = false;
+           obj.p_log.verbose = false;
            
            % loop through each segment and compare in pairs
            parfor ii = 1:length(obj.segPair)
@@ -389,7 +278,7 @@ classdef iops < hgsetget
            
            obj.coefs = (localCoefs./localInputCoefs)./obj.referenceCoefs; %normalise coefficients to input and reference
            
-           ip.p_log.verbose = true;
+           obj.p_log.verbose = true;
            
            
        end
@@ -566,12 +455,12 @@ classdef iops < hgsetget
            input = exp(-((X+obj.spacing/2/obj.p_xs).*obj.p_xs/xw).^2 - ((Y).*obj.p_xs/xw).^2) + exp(-((X-obj.spacing/2/obj.p_xs).*obj.p_xs/xw).^2 - ((Y).*obj.p_xs/xw).^2+1i*inputOffset);
            input = input.*obj.mask;
            
-           out = bpm(obj,abs(input).^2);
+           out = bpm(obj,input);
            
            figure();
            imagesc(abs(out).^2);
            
-           coef = measureOutput(obj,out);
+           coef = measureOutput(obj,abs(out).^2);
            
            fprintf('Gaussian coef: %d %d\n Gaussian ratio: %d\n',coef(1),coef(2),coef(1)/coef(2));
            
@@ -594,10 +483,243 @@ classdef iops < hgsetget
            fprintf('Gaussian coef: %d %d\n Gaussian ratio: %d\n',coef(1),coef(2),coef(1)/coef(2));
            
        end
+       
+       %% Set/Get xs
+       function val = get.xs(obj)
+           val = obj.p_xs;
+       end
+       
+       function set.xs(obj,val)
+           obj.xs=val;
+           obj.p_xs=val;
+           if obj.init
+               obj.initIOPS();
+           end
+       end
+       
+       %% Set/Get zs
+       function val = get.zs(obj)
+           val = obj.zs;
+       end
+       
+       function set.zs(obj,val)
+           obj.zs = val;
+           if obj.init
+               obj.initBPM();
+               obj.calibrateReferenceCoefs();
+           end
+       end
+       
+       %% Set/Get n
+       function val = get.n(obj)
+           val = obj.n;
+       end
+       
+       function set.n(obj,val)
+           obj.n = val;
+           if obj.init
+               obj.initBPM();
+               obj.calibrateReferenceCoefs();
+           end
+       end
+       
+       %% Set/Get deltaN
+       function val = get.deltaN(obj)
+           val = obj.deltaN;
+       end
+       
+       function set.deltaN(obj,val)
+           obj.deltaN = val;
+           if obj.init
+               obj.initBPM();
+               obj.calibrateReferenceCoefs();
+           end
+       end
+       
+       %% Set/Get sLength
+       function val = get.sLength(obj)
+           val = obj.sLength;
+       end
+       
+       function set.sLength(obj,val)
+           obj.sLength = val;
+           if obj.init
+               obj.calibrateReferenceCoefs();
+           end
+       end
+       
+       %% Set/Get tel
+       function val = get.tel(obj)
+           val = obj.tel;
+       end
+       
+       function set.tel(obj,val)
+           obj.tel = val;
+           
+           obj.segments = obj.tel.segment();
+       end
+       
+       %% Set/Get resolution
+       function val = get.resolution(obj)
+           val = obj.resolution;
+       end
+       
+       function set.resolution(obj,val)
+           obj.resolution = val;
+           if obj.init
+               obj.initIOPS();
+           end
+       end
+       
        function output = measureOutput(obj,buf)
+           %% measureOutput
            % sum each output image around its mask and return the pair of results
            output = [sum(sum(buf.*obj.mask1)); sum(sum(buf.*obj.mask2))];
        end
+       
+       
+       function calibrateReferenceCoefs(obj)
+           %% calibrateReferenceCoefs
+           % generate reference coefs from flat input
+           
+           obj.resetCoefs();
+           
+           src = source('wavelength',photometry.H);
+           src=src.*obj.tel.pupil;
+           
+           relay(obj,src);%ceofs set in here
+           
+           obj.referenceCoefs = obj.outputCoefs./obj.inputCoefs; %normalise reference coefficients to input
+           % reset other coefs
+           obj.resetCoefs();
+       end
+       
+       function resetCoefs(obj)
+           %% resetCoefs
+           % resets obj coefs - not including reference coefs
+           obj.coefs = zeros(2,length(obj.segPair));
+           obj.inputCoefs = zeros(2,length(obj.segPair));
+           obj.outputCoefs = zeros(2,length(obj.segPair));
+       end
+       
+       function resetReferenceCoefs(obj)
+           %% resetReferenceCoefs
+           % resets reference coefs
+           obj.referenceCoefs = zeros(2,length(obj.segPair));
+       end
+       
+       function calibrateXS(obj)
+           %% calibrateXS
+           % set the x scale (obj.xs) using an image from a telescope
+           % segment and a gaussian of known width
+           
+           % padding for fft - image size matches physical object size
+           res = obj.tel.resolution*(4*0.2/obj.xs)+1; % nyquist sampling *2
+           
+           % pixel scale of tel
+           gmtPx = obj.tel.resolution/obj.tel.D; %GMT pixel scale, pix/m
+           
+           %create a circular pupil in the centre
+           [X Y] = meshgrid(-res/2:res/2-1,-res/2:res/2-1);
+           
+           segPupil1 = (hypot(X,Y) < obj.tel.segmentD*gmtPx/2) - (hypot(X,Y) < obj.tel.centralObscurationD*gmtPx/2);
+           
+           % create an image from this pupil
+           img = fftshift(fft2(segPupil1));
+           
+           % measure the width of this image
+           width = iops.gaussWidth(abs(img).^2);
+           
+           
+           % create a Gaussian of known width
+           [X Y] = meshgrid(-obj.resolution/2:obj.resolution/2-1);
+           inputWidth = 2;
+           inE = exp(-((X).*obj.xs/inputWidth).^2 - ((Y).*obj.xs/inputWidth).^2);
+           % measure the width of this Gaussian - in pixels
+           inWidth = iops.gaussWidth(abs(inE).^2);
+           
+           % match the pixel scale to the ratio of these two widths: this
+           % matches the image size of correct scale to the fibre size
+           obj.p_xs = obj.xs/(width/inWidth); % change the input scale depending on fwhm of image
+           
+           obj.xs = obj.p_xs;
+           
+           if obj.p_xs > 0.4
+               fprintf('IOPS WARNING: Simulation grid may be too coarse, consider decreasing xs for more accurate results\n');
+           end
+       end
+       
+       function createMask(obj)
+           %% createMask
+           % create and set the fibre profile and mask for input
+
+           
+           obj.maskD = round(obj.core/obj.xs);
+  
+%            disk = fspecial('disk',obj.maskD/2);
+%            disk = disk./max(max(disk));
+           
+           
+           
+           % want the mask to have an odd number of pixels!!
+%            if ~rem(obj.maskD,2)
+%                obj.maskD = obj.maskD + 1; 
+%            end
+           
+           % fibre profile made of two discs of diameter core separated by spacing
+           obj.maskD = 2*round(obj.maskD/2) + 1; %use an odd number of pixels for the mask
+           disk=tools.piston(obj.maskD);
+           
+           obj.mask = zeros(obj.resolution);
+           
+           [sx sy] = size(disk);
+           
+           
+           % place the disk fibre profile on each side of centre.
+           % not using tools.piston with an offset here in case another
+           % profile is needed (eg fspecial('disk',obj.maskD/2); )
+           obj.mask(round(obj.resolution/2-sx/2:obj.resolution/2+sx/2-1),...
+                    round(obj.resolution/2-obj.spacing/2/obj.xs-sy/2:obj.resolution/2-obj.spacing/2/obj.xs+sy/2-1)) = disk;
+           % mask1 and mask2 are the mask for a single fibre
+           obj.mask1 = obj.mask;
+                
+           obj.mask(round(obj.resolution/2-sx/2:obj.resolution/2+sx/2-1),...
+                    round(obj.resolution/2+obj.spacing/2/obj.xs-sy/2:obj.resolution/2+obj.spacing/2/obj.xs+sy/2-1)) = disk;
+                
+           obj.mask2 = obj.mask - obj.mask1;
+           
+%            obj.mask1 = tools.piston(obj.core/obj.xs,obj.resolution,-obj.spacing/2/obj.xs,0,'type','double','shape','disc');
+%            obj.mask2 = tools.piston(obj.core/obj.xs,obj.resolution,obj.spacing/2/obj.xs,0,'type','double','shape','disc');
+%            obj.mask = obj.mask1+obj.mask2;
+       end
+       
+       function initBPM(obj)
+           %% initBPM
+           % parameters for bpm
+           obj.index = zeros(obj.resolution,obj.resolution)+obj.mask.*obj.deltaN;
+           obj.index = obj.index+obj.n;
+           
+           
+           obj.F = (2*pi/obj.wavelength).*obj.index;% index profile
+           obj.D = obj.wavelength/(4*pi*obj.n);% diffraction coeff
+           obj.kx = [0:obj.resolution/2-1,(-obj.resolution/2):-1].*(2*pi/(obj.xs*obj.resolution));% Fourier space index - no fftshift required
+           obj.ky = [0:obj.resolution/2-1,(-obj.resolution/2):-1].*(2*pi/(obj.xs*obj.resolution));
+           % Fourier space diffraction - for BPM
+           obj.MD = zeros(obj.resolution,obj.resolution);
+           for kyi=1:obj.resolution
+                for kxi=1:obj.resolution
+                   obj.MD(kxi,kyi) = exp(-1i*obj.D*((obj.kx(kxi)^2)+(obj.ky(kyi)^2))*obj.zs);
+                 end
+           end
+       end
+       
+       function resetImages(obj)
+           % complex amplitude of input and output
+           obj.inputE = zeros(obj.resolution,obj.resolution,length(obj.segPair));
+           obj.outputE = zeros(obj.resolution,obj.resolution,length(obj.segPair));
+           obj.unmaskedInput = zeros(obj.resolution,obj.resolution,length(obj.segPair)); % not multiplied by mask
+       end
+       
    end
    
    methods (Static)
