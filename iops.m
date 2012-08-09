@@ -571,6 +571,19 @@ classdef iops < hgsetget
            end
        end
        
+       %% Set/Get segPair
+       function val = get.segPair(obj)
+           val = obj.setPair;
+       end
+       
+       function set.segPair(obj,val)
+           obj.setPair = val;
+           
+           obj.resetCoefs();
+           obj.resetReferenceCoefs();
+           obj.calibrateReferenceCoefs();
+       end
+       
        function output = measureOutput(obj,buf)
            %% measureOutput
            % sum each output image around its mask and return the pair of results
