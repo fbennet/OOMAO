@@ -266,7 +266,7 @@ classdef deformableMirror < handle
                 
                 tel = src.opticalPath{1};
                 zern = zernike(tel,2:3);
-                zern.c = eye(2)*src.wavelength/4;
+                zern.c = eye(2)*calibDmStroke;
                 src = src.*zern;
                 buf = reshape(src.phase,tel.resolution,2*tel.resolution);
                 

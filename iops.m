@@ -36,6 +36,11 @@ classdef iops < hgsetget
        inputCoefs; % inputCoefs - how much light is coupled into each fibre
        outputCoefs; % outputCoefs - how much light is at the output of each fibre
        referenceCoefs; % referenceCoefs - normalised coefficients from a flat (0 segment piston) input
+       noisyOutCoefs; % same as outputCoefs but with noise added by cam
+       
+       
+       %noiseIOPSErrorRMS; %calibrated noisy output as RMS segment piston error
+       noiseIOPSSegPiston; %measured seg piston with noise
        
        % input and outputs
        inputE;
@@ -50,6 +55,35 @@ classdef iops < hgsetget
        mask2;
        mask; % total mask
        maskD; %mask diameter
+       
+       noRef = false; % false: reference ceofs calclated. true: reference coefs not calculated
+       
+       
+       % waveguide core size, um
+       core;
+       % waveguide spacing, um
+       spacing;
+       
+       % size of image from segment in um
+       imageSize = 3.8;
+       fftRes;
+       
+       %calibraion
+       push = (-pi/2:pi/512:pi/2);
+       p1=[-0.000187579635639019,0.000103397415346398,0.00847220717964620,-0.00336811364248796,-0.169950591692656,0.0405752026547439,1.01980303048773,1.00000045172564;];
+       p2=[-0.000196127194208802,0.000107052265535052,0.00885826554272511,-0.00348716836683480,-0.177694836591512,0.0420094385743573,1.06627303296335,1.00000046769305;];
+
+       
+       %detector for output noise
+       useNoisyDetector = false;
+       cam;
+       %default values for detector
+       QE = 1;
+       RN = 0;
+       intTime = 7.5;
+       bgPhotons = 349;
+       opticalTransmission = 0.5;
+       starMag = 16;
    end
    
    properties (Dependent, SetObservable=true)
@@ -68,10 +102,7 @@ classdef iops < hgsetget
        
        
        
-       % waveguide core size, um
-       core;
-       % waveguide spacing, um
-       spacing;
+      
        
        % waveguide output
        waveguideOutput;
@@ -102,18 +133,21 @@ classdef iops < hgsetget
        function obj = iops(tel,wavelength,varargin)
            p = inputParser;
            p.addParamValue('n', 1.46, @isnumeric);
-           p.addParamValue('deltaN',  0.02678, @isnumeric); %for 1550 nm  0.02678, for 1310 nm 0.025875
-           p.addParamValue('sLength', 1e4, @isnumeric);
+           p.addParamValue('deltaN',  0.005776245, @isnumeric); %for 1550 nm  0.02678, for 1310 nm 0.025875
+           p.addParamValue('sLength', 650, @isnumeric);
            p.addRequired('tel', @(x) isa(x,'telescopeAbstract'));
            p.addRequired('wavelength', @(x) isnumeric(x) || isa(x,'photometry') );
            p.addParamValue('resolution', 128, @isnumeric);
            p.addParamValue('absorbingBoundary', false, @islogical);
-           p.addParamValue('xs', 0.2, @isnumeric);
-           p.addParamValue('zs', 0.2, @isnumeric);
+           p.addParamValue('xs', 0.835, @isnumeric);
+           p.addParamValue('zs', 1, @isnumeric);
            p.addParamValue('useGPU', false, @islogical);
            p.addParamValue('mCPU', false, @islogical);
            p.addParamValue('useJacket', false, @islogical);
            p.addParamValue('segPair', [1:6;2:7], @isnumeric); % a vector of inputs to compare
+           p.addParamValue('noRef', false, @islogical);
+           p.addParamValue('core', 5, @isnumeric);
+           p.addParamValue('spacing', 10, @isnumeric);
 
            p.addParamValue('logging', true, @islogical);
 
@@ -158,13 +192,15 @@ classdef iops < hgsetget
            
            obj.segPair = p.Results.segPair;
            
+           obj.noRef = p.Results.noRef;
+           
            % I like even numbers!
            if rem(obj.tel.resolution,2) % odd number of pixels in telescope
                fprintf('IOPS WARNING: Odd number of pixels in Telescope object, IOPS may not run');
            end
            
-           obj.core = 4;
-           obj.spacing = 8;
+           obj.core = p.Results.core;
+           obj.spacing = p.Results.spacing;
            obj.segments = tel.segment();
            
            obj.initIOPS();
@@ -186,9 +222,13 @@ classdef iops < hgsetget
            obj.createMask();
            obj.initBPM();
            obj.resetCoefs();
+           obj.createDetector();
            obj.resetReferenceCoefs();
            obj.resetImages();
            obj.calibrateReferenceCoefs();
+           
+           
+
        end
        
        function display(obj)
@@ -246,6 +286,8 @@ classdef iops < hgsetget
            iE = zeros(res,res,length(obj.segPair));
            uE = zeros(res,res,length(obj.segPair));
            
+           localSrcPhase = src.phase;
+           
            % _try_ to supress some oomao output!
            obj.p_log.verbose = false;
            
@@ -253,7 +295,7 @@ classdef iops < hgsetget
            parfor ii = 1:length(obj.segPair)
                
                % create the input
-               input = generateInput(obj,obj.segPair(1,ii),obj.segPair(2,ii),src);
+               input = generateInput(obj,obj.segPair(1,ii),obj.segPair(2,ii),localSrcPhase);
                uE(:,:,ii) = input; %unmasked input
                input = input.*obj.mask; %masked input
                iE(:,:,ii) = input; %store for later
@@ -278,13 +320,19 @@ classdef iops < hgsetget
            
            obj.coefs = (localCoefs./localInputCoefs)./obj.referenceCoefs; %normalise coefficients to input and reference
            
+           % add detector noise
+           
+           obj.noisyOutCoefs = obj.addDetectorNoiseToOutput();
+           
            obj.p_log.verbose = true;
            
            
        end
        
-       function input = generateInput(obj,seg1,seg2,src)
+       function input = generateInput(obj,seg1,seg2,srcPhase)
            %% Generates the input image with phase
+           % input = generateInput(obj,seg1,seg2,src)
+           % 
            
            % keep a few pixels outside mask for rounding error
            padding = 2; % take an extra few pixels
@@ -298,7 +346,8 @@ classdef iops < hgsetget
            
            telRes = obj.tel.resolution;
            % padding for fft - image size matches physical object size
-           padRes = round(telRes*(4*0.2043/obj.xs)+1); % nyquist sampling *2
+           %padRes = round(telRes*(4*0.2043/obj.xs)+1); % nyquist sampling *2
+           padRes = obj.fftRes;
            % create circular pupils
            [X Y] = meshgrid(-padRes/2+0.5:padRes/2-0.5,-padRes/2+0.5:padRes/2-0.5);
            % segment 1 is different to the rest
@@ -345,7 +394,7 @@ classdef iops < hgsetget
            % take the phase from src.phase
            phase(pr2-segPupilR+1:pr2+segPupilR,...
                 pr2-segPupilR+1:pr2+segPupilR) =...
-                    src.phase(segCoords(2,seg1)-(segPupilR-1):segCoords(2,seg1)+segPupilR,...
+                    srcPhase(segCoords(2,seg1)-(segPupilR-1):segCoords(2,seg1)+segPupilR,...
                     segCoords(1,seg1)-(segPupilR-1):segCoords(1,seg1)+segPupilR);
                 
            phase = phase.*segPupil; %remove any clipping of other segments - done use segPupil1 here!
@@ -357,12 +406,39 @@ classdef iops < hgsetget
            input1 = fftshift(fft2(wave));
            % recreate the image, this time removing noise generated by fft
            input1 = abs(input1).*exp(1i.*(angle(input1)-noise1));
+           
+           
+           fac=0;
+           t=phase(:);
+           
+           if mean(t(logical(pup1(:)))) > 0
+%                fac=pi;
+           end
+           if mean(t(logical(pup1(:)))) > pi
+%                fac=2*pi;
+           end
+           if mean(t(logical(pup1(:)))) > 2*pi
+%                fac=3*pi;
+           end
+           tmp=angle(input1);
+           tmp=tmp(:);
+           tmp=tmp-(mean(t(logical(pup1(:))))-fac);
+
+           tst=abs(tmp)>0.2;
+
+           tmp(tst) = 0;
+
+           tmp=tmp+(mean(t(logical(pup1(:))))-fac);
+           
+           tmp=reshape(tmp,size(input1));
+           
+%            input1 = abs(input1).*exp(1i.*tmp);
 
            % same thing for the other segment
            phase2 = zeros(padRes);
            phase2(pr2-segPupilR+1:pr2+segPupilR,...
                 pr2-segPupilR+1:pr2+segPupilR) =...
-                    src.phase(segCoords(2,seg2)-(segPupilR-1):segCoords(2,seg2)+segPupilR,...
+                    srcPhase(segCoords(2,seg2)-(segPupilR-1):segCoords(2,seg2)+segPupilR,...
                     segCoords(1,seg2)-(segPupilR-1):segCoords(1,seg2)+segPupilR);
                 
            phase2 = phase2.*segPupil;
@@ -372,6 +448,32 @@ classdef iops < hgsetget
            input2 = fftshift(fft2(wave2));
 
            input2 = abs(input2).*exp(1i.*(angle(input2)-noise2));
+           
+           t2=phase2(:);
+           
+%            fac=0;
+           if mean(t2(logical(pup2(:)))) > 0
+%                fac=pi;
+           end
+           if mean(t2(logical(pup2(:)))) > pi
+%                fac=2*pi;
+           end
+           if mean(t2(logical(pup2(:)))) > 2*pi
+%                fac=3*pi;
+           end
+           tmp=angle(input2);
+           tmp=tmp(:);
+           tmp=tmp-((mean(t2(logical(pup2(:))))-fac));
+
+           tst=abs(tmp)>0.2;
+
+           tmp(tst) = 0;
+
+           tmp=tmp+((mean(t2(logical(pup2(:))))-fac));
+           
+           tmp=reshape(tmp,size(input2));
+           
+%            input2 = abs(input2).*exp(1i.*tmp);
            
            %normalise inputs: take reduced real part (due to exp(i phase shift) into account
            
@@ -399,6 +501,7 @@ classdef iops < hgsetget
 %            % normalise inputs
 %            input1 = input1./abs(norm1);
 %            input2 = input2./abs(norm2);
+
            norm1 = max(abs(input1(:)));
            input1 = input1./norm1;
            input2 = input2./norm1;
@@ -439,8 +542,296 @@ classdef iops < hgsetget
 %            input = input.*obj.mask;
        end
        
+       function scaledRefCoef = addDetectorNoiseToOutput(obj)
+           
+           % number of photons per segment arriving at IOPS
+           nPhotonPerSeg = 2.926e10*exp(-0.921*obj.starMag);% exp fit calulated from Kristina's spreadsheet
+
+           nPhotonPerIOPSOutput = nPhotonPerSeg*obj.opticalTransmission/3*obj.intTime;% each segment is split to 3 outputs
+           
+           % scale output to correct number of photons - each image has two outputs
+           % needs to be with flat input wavefront!!!
+           scaleVec = 2*nPhotonPerIOPSOutput./sum(obj.outputCoefs);
+           scaleVecIn = 2*nPhotonPerIOPSOutput./sum(obj.inputCoefs);
+           
+           % take a single value from scaleVec as the scale - central segment has
+           % fewer photons!
+
+           photonScale = mean(scaleVec(2:end));
+           photonScaleIn = mean(scaleVecIn(2:end));
+
+
+           scaledOutCoef = obj.outputCoefs.*photonScale;
+           scaledInCoef = obj.inputCoefs.*photonScaleIn;
+
+           noiseSrc = source();
+
+           noisyOutput = zeros(2,6);
+           noisyInput = zeros(2,6);
+           for ii = 1:6
+           noiseSrc = noiseSrc.*{sqrt(scaledOutCoef(1,ii)),0}*obj.cam;
+           noisyOutput(1,ii) = obj.cam.frame;
+           noiseSrc = noiseSrc.*{sqrt(scaledOutCoef(2,ii)),0}*obj.cam;
+           noisyOutput(2,ii) = obj.cam.frame;
+           
+           noiseSrc = noiseSrc.*{sqrt(scaledInCoef(1,ii)),0}*obj.cam;
+           noisyInput(1,ii) = obj.cam.frame;
+           noiseSrc = noiseSrc.*{sqrt(scaledInCoef(2,ii)),0}*obj.cam;
+           noisyInput(2,ii) = obj.cam.frame;
+           end
+
+           scaledRefCoef = noisyOutput./noisyInput;
+           
+           noisyOutput = zeros(2,6);
+            noisyInput = zeros(2,6);
+            for ii = 1:6
+            noiseSrc = noiseSrc.*{sqrt(scaledOutCoef(1,ii)),0}*obj.cam;
+            noisyOutput(1,ii) = obj.cam.frame;
+            noiseSrc = noiseSrc.*{sqrt(scaledOutCoef(2,ii)),0}*obj.cam;
+            noisyOutput(2,ii) = obj.cam.frame;
+
+            noiseSrc = noiseSrc.*{sqrt(scaledInCoef(1,ii)),0}*obj.cam;
+            noisyInput(1,ii) = obj.cam.frame;
+            noiseSrc = noiseSrc.*{sqrt(scaledInCoef(2,ii)),0}*obj.cam;
+            noisyInput(2,ii) = obj.cam.frame;
+            end
+
+
+            % calculate noisy IOPS output
+
+            noisyCoefs = noisyOutput./noisyInput./scaledRefCoef;
+
+            noiseIOPS = zeros(6,1);
+            for jj=1:6
+                kk=length(obj.push);
+                pFn=obj.p2;
+                if jj==1
+                    pFn = obj.p1;
+                end
+
+                coefToUse = noisyCoefs(1,jj);
+                fac=1;
+                if noisyCoefs(2,jj) > coefToUse
+                    coefToUse = noisyCoefs(2,jj);
+                    fac = -1;
+                end
+
+                %while noisyCoefs(1,jj) < polyval(pFn,push(kk))
+                while coefToUse < polyval(pFn,obj.push(kk))
+                    kk=kk-1;
+                    if kk==0
+                        kk=1;
+                        break;
+                    end
+                end
+                noiseIOPS(jj) = obj.push(kk)*fac;
+            end
+
+            %dont have staticSegPiston, so just report the measured seg piston
+            %noiseIOPSError = ((staticSegPiston(1:6)- staticSegPiston(2:7)) - noiseIOPS')*1550/2/pi;
+            %obj.noiseIOPSErrorRMS = sqrt(meansqr(noiseIOPSError));
+            obj.noiseIOPSSegPiston = noiseIOPS'.*1550/2/pi;
+        
+       end
+       
+       function calibrateIOPS(obj,tel,src)
+           push_ = (-pi/2:pi/32:pi/2); %distance to push segment
+
+           totCalibCoefs = zeros(length(push_),2,length(ip.coefs));
+
+           for ii=1:length(push_)
+               % src uses angle(phase)- causes a jump at pi!
+               % use src=src.*{amplitude,phase}
+               src = src.*{tel.pupil,tel.segment{1}.pupil.*push(ii)+tel.segment{5}.pupil.*obj.push(ii)+tel.pupil.*0}*ip;
+               totCalibCoefs(ii,:,:) = ip.coefs;
+           end
+           obj.p1=polyfit(push_',totCalibCoefs(:,1,1),7);
+           obj.p2=polyfit(push_',totCalibCoefs(:,1,5),7);
+       end
+       
+       function out=calibrateIOPSOutputCoefs(obj)
+           
+           outCoef = zeros(2,6);
+           inCoef = zeros(2,6);
+           for ii=1:6
+               outCoef(:,ii) = obj.measureOutput(abs(obj.outputE(:,:,ii)).^2);
+               inCoef(:,ii) = obj.measureOutput(abs(obj.inputE(:,:,ii)).^2);
+           end
+           measuredCoef = (outCoef./inCoef)./ip.referenceCoefs;
+           loopTotCalibCoef = zeros(2,6);
+           for jj=1:6
+               kk=length(obj.push);
+               pFn=obj.p2;
+               if jj==1
+                   pFn = obj.p1;
+               end
+               while measuredCoef(1,jj) < polyval(pFn,obj.push(kk))
+                   kk=kk-1;
+                   if kk==0
+                       kk=1;
+                       break;
+                   end
+               end
+               loopTotCalibCoef(1,jj) = obj.push(kk);
+            end
+
+
+            totSegPiston = segPiston(totPhase./(kIteration));
+            out = sqrt(meansqr([totSegPiston(1:6)-totSegPiston(2:7)-loopTotCalibCoef(1,:)']))*1.550/2/pi;
+       end
+       
+       
+       function out=taperedInput(obj,seg,src)
+           %% taperedInput(obj,seg)
+           % computes a tapered fibre input for segment number seg
+           
+           startSize = 10;
+           endSize = 6;
+           nSteps = 1e4;
+           grad = -atan((startSize-endSize)/nSteps);%gradient
+           
+           [X Y] = meshgrid(-obj.resolution/2+0.5:obj.resolution/2-0.5,-obj.resolution/2+0.5:obj.resolution/2-0.5);
+           circ = hypot(X,Y)<startSize/obj.xs;
+           
+
+           
+           indexPro = zeros(obj.resolution,obj.resolution)+circ.*obj.deltaN;
+           indexPro = indexPro+obj.n;
+           
+           
+           F_ = (2*pi/obj.wavelength).*indexPro;% index profile
+           
+           
+           %tel pixel scale
+           gmtPx = obj.tel.resolution/obj.tel.D; %GMT pixel scale, pix/m
+           
+           telRes = obj.tel.resolution;
+           % padding for fft - image size matches physical object size
+           %padRes = round(telRes*(4*0.2043/obj.xs)+1); % nyquist sampling *2
+           padRes = obj.fftRes;
+           % create circular pupils
+           [X Y] = meshgrid(-padRes/2+0.5:padRes/2-0.5,-padRes/2+0.5:padRes/2-0.5);
+           % segment 1 is different to the rest
+           
+           % subtract one pixel to try and match tel pupil better
+           segPupil1 = (hypot(X,Y) < (obj.tel.segmentD*gmtPx/2 - 1)) - (hypot(X,Y) < (obj.tel.centralObscurationD*gmtPx/2 + 1));
+           
+           segPupil = hypot(X,Y) < (obj.tel.segmentD*gmtPx/2 - 1);
+           % noise in the complex part of the image - an fft artifact only
+           seg1FftNoise = angle(fftshift(fft2(segPupil1)));
+           segFftNoise = angle(fftshift(fft2(segPupil)));
+           %radius of segment pupil in px
+           segPupilR = round(gmtPx*obj.tel.segmentD/2); 
+           
+           segCoords = [round(gmtPx*real(obj.tel.segmentCoordinate))+telRes/2; round(gmtPx*imag(obj.tel.segmentCoordinate))+telRes/2];
+
+           pup1 = segPupil;
+           noise1 = segFftNoise;
+
+
+           % use central segment pupil
+           if seg == 1
+               pup1 = segPupil1;
+               noise1 = seg1FftNoise;
+           end
+
+
+
+           % create two images, one for each segment to be compared
+           % image for seg1
+           phase = zeros(padRes);
+           pr2 = round(padRes/2);
+           % take the phase from src.phase
+           phase(pr2-segPupilR+1:pr2+segPupilR,...
+                pr2-segPupilR+1:pr2+segPupilR) =...
+                    src.phase(segCoords(2,seg)-(segPupilR-1):segCoords(2,seg)+segPupilR,...
+                    segCoords(1,seg)-(segPupilR-1):segCoords(1,seg)+segPupilR);
+                
+           phase = phase.*segPupil; %remove any clipping of other segments - done use segPupil1 here!
+
+           % create a complex amplitude from this phase and pupil
+           wave = pup1.*exp(1i.*phase);
+           
+           % create an image from this complex amplitude
+           input = fftshift(fft2(wave));
+           % recreate the image, this time removing noise generated by fft
+           input = abs(input).*exp(1i.*(angle(input)-noise1));
+           [sx sy] = size(input);
+           input = input(sx/2-obj.resolution/2:sx/2+obj.resolution/2-1,sx/2-obj.resolution/2:sx/2+obj.resolution/2-1);
+           
+           
+           % BPM for tapered input
+           if obj.useGPU
+                gMD = gpuArray(obj.MD);
+                gE = gpuArray(input);
+                gZs = gpuArray(obj.zs);
+                gF = gpuArray(F_);
+            else
+                if obj.useJacket
+                    gMD = gdouble(obj.MD);
+                    gE = gdouble(input);
+                    gZs = gdouble(obj.zs);
+                    gF = gdouble(F_);
+                else
+                    gMD = obj.MD;
+                    gE = input;
+                    gZs = obj.zs;
+                    gF = F_;
+                end
+            end
+            
+            [X Y] = meshgrid(-obj.resolution/2+0.5:obj.resolution/2-0.5,-obj.resolution/2+0.5:obj.resolution/2-0.5);
+            fprintf('IOPS: Tapered fibre');
+            
+            
+            for j=0:obj.zs:nSteps
+                
+                if rem(j/obj.zs,obj.sLength/(10*obj.zs)) == 0
+                    fprintf('.');
+                end
+                
+                e=fft2(gE);
+                newe = e.*gMD;
+                newE = ifft2(newe);
+
+                circ = hypot(X,Y)<(grad*j+startSize)/obj.xs;
+           
+                indexPro = zeros(obj.resolution,obj.resolution)+circ.*obj.deltaN;
+                indexPro = indexPro+obj.n;
+           
+           
+                gF = gdouble((2*pi/obj.wavelength).*indexPro);% index profile
+                
+
+                gE = newE.*exp(1i*gF*gZs);
+
+                %absorbing boundary
+                if (obj.absorbingBoundary)
+                    gE(:,1:3) = 0;
+                    gE(:,obj.resolution-2:obj.resolution) = 0;
+                    gE(1:3,:) = 0;
+                    gE(obj.resolution-2:obj.resolution,:) = 0;
+                end
+
+            end
+            
+            fprintf('DONE\n');
+           
+            if obj.useGPU
+                out = gather(gE);
+            else
+                if obj.useJacket
+                    out = double(gE);
+                else
+                    out = gE;
+                end
+            end
+           
+       end
+       
        function testBPM(obj,offset)
-           %% Test the BPM with current parameters
+           %% testBPM
+           %Test the BPM with current parameters
            %
 
 
@@ -450,9 +841,9 @@ classdef iops < hgsetget
            inputOffset = offset;
            
            [X Y] = meshgrid(-obj.resolution/2+1:obj.resolution/2);
-           xw = 2;% gaussian width
-           
-           input = exp(-((X+obj.spacing/2/obj.p_xs).*obj.p_xs/xw).^2 - ((Y).*obj.p_xs/xw).^2) + exp(-((X-obj.spacing/2/obj.p_xs).*obj.p_xs/xw).^2 - ((Y).*obj.p_xs/xw).^2+1i*inputOffset);
+           %xw = obj.wavelength/(pi*sqrt((obj.deltaN+obj.n)^2-obj.n^2));% gaussian width - matched to NA of waveguide
+           xw=3.8;
+           input = exp(-((X+obj.spacing/2/obj.p_xs).*obj.p_xs/xw).^2 - ((Y).*obj.p_xs/xw).^2) + exp(-((X-obj.spacing/2/obj.p_xs+1).*obj.p_xs/xw).^2 - ((Y).*obj.p_xs/xw).^2+1i*inputOffset);
            input = input.*obj.mask;
            
            out = bpm(obj,input);
@@ -473,12 +864,95 @@ classdef iops < hgsetget
            input = exp(-((X+obj.spacing/2/obj.p_xs)./width).^2 - ((Y)./width).^2);
            input = input.*obj.mask;
            
-           out = bpm(obj,abs(input).^2);
+           out = bpm(obj,input);
            
            figure();
            imagesc(abs(out).^2);
            
-           coef = measureOutput(obj,out);
+           coef = measureOutput(obj,abs(out).^2);
+           
+           fprintf('Gaussian coef: %d %d\n Gaussian ratio: %d\n width of image %d\n',coef(1),coef(2),coef(1)/coef(2),width);
+           
+       end
+       
+       function testBPM2(obj,coreSize,xw)
+           %% testBPM2
+           % test bpm with a single core with radius coreSize
+           
+           maskD_ = round(coreSize/obj.xs);
+           maskD_ = 2*round(maskD_/2) + 1; %use an odd number of pixels for the mask
+           disk=tools.piston(maskD_);
+           
+           mask_ = zeros(obj.resolution);
+           
+           [sx sy] = size(disk);
+           
+           
+           
+           mask_(round(obj.resolution/2-sx/2:obj.resolution/2+sx/2-1),...
+                round(obj.resolution/2-sy/2:obj.resolution/2+sy/2-1)) = disk;
+                
+           [X Y] = meshgrid(-obj.resolution/2+1:obj.resolution/2);
+%            xw = 2;% gaussian width
+           
+           input = exp(-((X).*obj.p_xs/xw).^2 - ((Y).*obj.p_xs/xw).^2);
+           input = input.*mask_;
+           
+           obj.mask = mask_;
+           obj.initBPM;
+           
+           out = bpm(obj,input);
+           
+           figure();
+           imagesc(abs(out).^2);
+           
+           integralOut = sum(sum(abs(out).^2.*mask_));
+          
+           fprintf('output integral: %d\n',integralOut);
+           
+           obj.createMask();
+           obj.initBPM();
+           
+       end
+       
+       function out = testBPM3(obj,stepSize)
+           %% testBPM3
+           
+           sL = obj.sLength;
+           
+           obj.sLength = stepSize;
+           out = zeros(obj.resolution,obj.resolution,sL/stepSize);
+           
+           [X Y] = meshgrid(-obj.resolution/2+1:obj.resolution/2);
+           
+           input = exp(-((X+obj.spacing/2/obj.p_xs).*obj.p_xs/3.8).^2 - ((Y).*obj.p_xs/3.8).^2);
+           
+           out(:,:,1) = input;
+           
+           for ii=2:sL/stepSize
+               out(:,:,ii) = obj.bpm(reshape(out(:,:,ii-1),obj.resolution,obj.resolution));
+           end
+           
+           obj.sLength = sL;
+           
+       end
+       
+       function testBPM4(obj)
+           %% testBPM4
+           
+           [X Y] = meshgrid(-obj.resolution/2+1:obj.resolution/2);
+           
+           input = exp(-((X+obj.spacing/2/obj.p_xs).*obj.p_xs/3.8).^2 - ((Y).*obj.p_xs/3.8).^2);
+
+           out = obj.bpm(input);
+           
+           figure();
+           imagesc(abs(input).^2);
+           
+           figure();
+           imagesc(abs(out).^2);
+           
+           coef = measureOutput(obj,abs(out).^2);
            
            fprintf('Gaussian coef: %d %d\n Gaussian ratio: %d\n',coef(1),coef(2),coef(1)/coef(2));
            
@@ -493,7 +967,12 @@ classdef iops < hgsetget
            obj.xs=val;
            obj.p_xs=val;
            if obj.init
-               obj.initIOPS();
+               obj.createMask();
+               obj.initBPM();
+               obj.resetCoefs();
+               obj.resetReferenceCoefs();
+               obj.resetImages();
+               obj.calibrateReferenceCoefs();
            end
        end
        
@@ -573,15 +1052,40 @@ classdef iops < hgsetget
        
        %% Set/Get segPair
        function val = get.segPair(obj)
-           val = obj.setPair;
+           val = obj.segPair;
        end
        
        function set.segPair(obj,val)
-           obj.setPair = val;
-           
+           obj.segPair = val;
+           if obj.init
            obj.resetCoefs();
            obj.resetReferenceCoefs();
            obj.calibrateReferenceCoefs();
+           end
+       end
+       
+       %% Set/Get core
+       function val = get.core(obj)
+           val = obj.core;
+       end
+       
+       function set.core(obj,val)
+           obj.core = val;
+           if obj.init
+               obj.initIOPS();
+           end
+       end
+       
+       %% Set/Get spacing
+       function val = get.spacing(obj)
+           val = obj.spacing;
+       end
+       
+       function set.spacing(obj,val)
+           obj.spacing = val;
+           if obj.init
+               obj.initIOPS();
+           end
        end
        
        function output = measureOutput(obj,buf)
@@ -594,17 +1098,19 @@ classdef iops < hgsetget
        function calibrateReferenceCoefs(obj)
            %% calibrateReferenceCoefs
            % generate reference coefs from flat input
-           
-           obj.resetCoefs();
-           
-           src = source('wavelength',photometry.H);
-           src=src.*obj.tel.pupil;
-           
-           relay(obj,src);%ceofs set in here
-           
-           obj.referenceCoefs = obj.outputCoefs./obj.inputCoefs; %normalise reference coefficients to input
-           % reset other coefs
-           obj.resetCoefs();
+           if ~obj.noRef
+               fprintf('IOPS: Calibrating reference coefficients');
+               obj.resetCoefs();
+
+               src = source('wavelength',photometry.H);
+               src=src.*obj.tel.pupil;
+
+               relay(obj,src);%ceofs set in here
+
+               obj.referenceCoefs = obj.outputCoefs./obj.inputCoefs; %normalise reference coefficients to input
+               % reset other coefs
+               obj.resetCoefs();
+           end
        end
        
        function resetCoefs(obj)
@@ -613,6 +1119,7 @@ classdef iops < hgsetget
            obj.coefs = zeros(2,length(obj.segPair));
            obj.inputCoefs = zeros(2,length(obj.segPair));
            obj.outputCoefs = zeros(2,length(obj.segPair));
+           obj.noisyOutCoefs = zeros(2,length(obj.segPair));
        end
        
        function resetReferenceCoefs(obj)
@@ -621,13 +1128,82 @@ classdef iops < hgsetget
            obj.referenceCoefs = zeros(2,length(obj.segPair));
        end
        
+       function createDetector(obj)
+           cam_ = detector(1);
+           
+           
+           cam_.quantumEfficiency = obj.QE;
+           cam_.readOutNoise = obj.RN;
+
+           cam_.photonNoise = true;
+           cam_.exposureTime = 0;
+           
+           cam_.nPhotonBackground = obj.bgPhotons/3*obj.opticalTransmission*obj.intTime;
+           
+           obj.cam = cam_;
+       end
+       
+       %% Set/Get for detector values
+       function val = get.QE(obj)
+           val = obj.QE;
+       end
+       
+       function set.QE(obj,val)
+           obj.QE = val;
+           obj.cam.QE = obj.QE;
+       end
+       
+       function val = get.RN(obj)
+           val = obj.RN;
+       end
+       
+       function set.RN(obj,val)
+           obj.RN = val;
+           obj.cam.RN = obj.RN;
+       end
+       
+       function val = get.intTime(obj)
+           val = obj.intTime;
+       end
+       
+       function set.intTime(obj,val)
+           obj.intTime = val;
+           obj.cam.nPhotonBackground = obj.bgPhotons/3*obj.opticalTransmission*obj.intTime;
+       end
+       
+       function val = get.opticalTransmission(obj)
+           val = obj.opticalTransmission;
+       end
+       
+       function set.opticalTransmission(obj,val)
+           obj.opticalTransmission = val;
+           obj.cam.nPhotonBackground = obj.bgPhotons/3*obj.opticalTransmission*obj.intTime;
+       end
+       
+       function val = get.bgPhotons(obj)
+           val = obj.bgPhotons;
+       end
+       
+       function set.bgPhotons(obj,val)
+           obj.bgPhotons = val;
+           obj.cam.nPhotonBackground = obj.bgPhotons/3*obj.opticalTransmission*obj.intTime;
+       end
+       
+       function val = get.starMag(obj)
+           val = obj.starMag;
+       end
+       
+       function set.starMag(obj,val)
+           obj.starMag = val;
+       end
+       
        function calibrateXS(obj)
            %% calibrateXS
            % set the x scale (obj.xs) using an image from a telescope
            % segment and a gaussian of known width
            
            % padding for fft - image size matches physical object size
-           res = obj.tel.resolution*(4*0.2/obj.xs)+1; % nyquist sampling *2
+           res = obj.tel.resolution+1; % nyquist sampling *2
            
            % pixel scale of tel
            gmtPx = obj.tel.resolution/obj.tel.D; %GMT pixel scale, pix/m
@@ -646,20 +1222,27 @@ classdef iops < hgsetget
            
            % create a Gaussian of known width
            [X Y] = meshgrid(-obj.resolution/2:obj.resolution/2-1);
-           inputWidth = 2;
+           inputWidth = obj.imageSize;
            inE = exp(-((X).*obj.xs/inputWidth).^2 - ((Y).*obj.xs/inputWidth).^2);
            % measure the width of this Gaussian - in pixels
            inWidth = iops.gaussWidth(abs(inE).^2);
            
-           % match the pixel scale to the ratio of these two widths: this
-           % matches the image size of correct scale to the fibre size
-           obj.p_xs = obj.xs/(width/inWidth); % change the input scale depending on fwhm of image
-           
-           obj.xs = obj.p_xs;
-           
-           if obj.p_xs > 0.4
-               fprintf('IOPS WARNING: Simulation grid may be too coarse, consider decreasing xs for more accurate results\n');
+           while abs(width-inWidth)>0.1
+               res = res*inWidth/width;
+               
+               gmtPx = obj.tel.resolution/obj.tel.D; %GMT pixel scale, pix/m
+               [X Y] = meshgrid(-res/2:res/2-1,-res/2:res/2-1);
+               segPupil1 = (hypot(X,Y) < obj.tel.segmentD*gmtPx/2) - (hypot(X,Y) < obj.tel.centralObscurationD*gmtPx/2);
+               img = fftshift(fft2(segPupil1));
+               width = iops.gaussWidth(abs(img).^2);
            end
+          
+           obj.fftRes = round(res);
+           
+           if rem(obj.fftRes,2) == 0
+               obj.fftRes = obj.fftRes+1;
+           end
+
        end
        
        function createMask(obj)
