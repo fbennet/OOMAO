@@ -35,7 +35,7 @@ classdef linearMMSE < handle
         Cox
         CoxLag % temporal lag
         nGuideStar
-        nmmseStar
+        nMmseStar
         % error unit
         unit;
         % Bayesian minimum mean square error        
@@ -61,6 +61,10 @@ classdef linearMMSE < handle
         prediction = false;
         % additive error covariance
         G = 0;
+        % resolution of the phase map; this property is used inside the
+        % mtimes method; the phase map is computed first on a grid of size
+        % sampling and then interpolated on a grid of size resolution
+        resolution;
     end
     
     properties (SetObservable=true)
@@ -124,11 +128,12 @@ classdef linearMMSE < handle
             inputs.addParamValue('unit',[],@isnumeric);
             inputs.addParamValue('model','zonal',@ischar);
             inputs.addParamValue('zernikeMode',[],@isnumeric);
-            inputs.addParamValue('noiseCovariance',[],@isnumeric);
+            inputs.addParamValue('noiseCovariance',0,@isnumeric);
             inputs.addParamValue('tilts','Z',@ischar);
             inputs.addParamValue('lag',0,@isnumeric);
             inputs.addParamValue('xyOutput',[],@isnumeric);
             inputs.addParamValue('G',0,@isnumeric);
+            inputs.addParamValue('P',1,@isnumeric);
            
             inputs.parse(sampling,diameter,atmModel,guideStar,varargin{:});
             
@@ -138,16 +143,16 @@ classdef linearMMSE < handle
             obj.guideStar  = inputs.Results.guideStar;
             obj.nGuideStar = length(obj.guideStar);
             obj.p_mmseStar = inputs.Results.mmseStar;    
-            obj.nmmseStar  = length(obj.p_mmseStar);
+            obj.nMmseStar  = length(obj.p_mmseStar);
             obj.pupil      = inputs.Results.pupil;   
             obj.unit       = inputs.Results.unit;   
             obj.model      = inputs.Results.model;
             obj.zernikeMode= inputs.Results.zernikeMode;
-            obj.noiseCovariance   = inputs.Results.noiseCovariance;
             obj.tilts      = inputs.Results.tilts;
             obj.p_lag        = inputs.Results.lag;
             obj.xyOutput     = inputs.Results.xyOutput;
             obj.G            = inputs.Results.G;
+            obj.resolution   = obj.sampling;
             
             obj.guideStarListener = addlistener(obj,'guideStar','PostSet',@obj.resetGuideStar);
             fprintf(' @(linearMMSE)> atmosphere wavelength set to mmse star wavelength!\n') 
@@ -172,7 +177,7 @@ classdef linearMMSE < handle
                             matlabpool('open')
                             poolWasAlreadyOpen = false;
                         catch ME
-                            ME
+                            ME;
                         end
                     end
                     
@@ -196,6 +201,10 @@ classdef linearMMSE < handle
                     else
                         obj.Coo = phaseStats.covarianceMatrix(complex(obj.xyOutput(:,1),obj.xyOutput(:,2)),obj.atmModel);
                     end
+                    
+                    obj.p_P                 = inputs.Results.P;
+                    spaceJump(obj);
+                    obj.p_noiseCovariance   = inputs.Results.noiseCovariance;                        
                     
                     if ~poolWasAlreadyOpen
                         matlabpool('close')
@@ -302,20 +311,10 @@ classdef linearMMSE < handle
         %% Set/Get P
         function set.P(obj,val)
             obj.p_P = val;
-            if isempty(obj.P)
-                obj.Cxx = obj.covarianceSafe{1};
-                obj.Cox = obj.covarianceSafe{2};
-                obj.CoxLag = obj.covarianceSafe(3);
-            else
-                fprintf(' -->> Space jump!\n')
-                obj.covarianceSafe = { obj.Cxx , obj.Cox , obj.CoxLag };
-                obj.Cxx = obj.P*obj.Cxx*obj.P';
-                obj.Cox = cellfun( @(x) x*obj.P', obj.Cox , 'UniformOutput', false);
-                if obj.lag>0
-                    obj.CoxLag = cellfun( @(x) x*obj.P', obj.CoxLag , 'UniformOutput', false);
-                end
+            if ~isempty(obj.p_P)
+                spaceJump(obj);
+                solveMmse(obj);
             end
-            solveMmse(obj);
         end
         function val = get.P(obj)
             val = obj.p_P;
@@ -498,10 +497,10 @@ classdef linearMMSE < handle
               fx = pixelScale*fx*resolution/2;
               fy = pixelScale*fy*resolution/2;
             
-              fc = 1;
-              psd = fourierAdaptiveOptics.fittingPSD(fx,fy,fc,obj.atmModel);
-              sf  = fft2(fftshift(psd))*pixelScale^2;
-              sf  = 2*fftshift( sf(1) - sf );
+%               fc = 1;
+%               psd = fourierAdaptiveOptics.fittingPSD(fx,fy,fc,obj.atmModel);
+%               sf  = fft2(fftshift(psd))*pixelScale^2;
+%               sf  = 2*fftshift( sf(1) - sf );
             
               [rhoX,rhoY] = freqspace(resolution,'meshgrid');
               rhoX = 0.5*rhoX/pixelScale;
@@ -511,9 +510,12 @@ classdef linearMMSE < handle
               [u,v] = freqspace(resolution,'meshgrid');
               fftPhasor = exp(1i.*pi.*(u+v)*0.5);
 
-              thisOtf = otf(obj,rhoX+1i.*rhoY).*exp(-0.5*sf);
+              thisOtf = otf(obj,rhoX+1i.*rhoY);%.*exp(-0.5*sf);
 %               figure
 %               mesh(rhoX,rhoY,thisOtf)
+size(rhoX)
+size(fftPhasor)
+size(thisOtf)
               out = real(ifftshift(ifft2(ifftshift(fftPhasor.*thisOtf))))/pixelScale^2;
               out = out./obj.tel.area;
 %               out = out.*obj.strehlRatio./max(out(:));
@@ -558,10 +560,9 @@ classdef linearMMSE < handle
 %             add(obj.log,obj,'Pupil error variance map computation in progress...')
             out = cellfun( @diag , obj.Bmse' , 'uniformOutput', false );
             out = cell2mat(out);
-            map = zeros(obj.sampling,obj.sampling*obj.nmmseStar);
-            mask = repmat( obj.pupil, 1 , obj.nmmseStar);
+            map = zeros(obj.sampling,obj.sampling*obj.nMmseStar);
+            mask = repmat( obj.pupil, 1 , obj.nMmseStar);
             map(mask) = out;
-                
         end
        
         function out = get.var(obj)
@@ -603,6 +604,65 @@ classdef linearMMSE < handle
             end
         end        
 
+        function wfe(obj)
+            m_rmsMap = obj.rmsMap;
+            imagesc(m_rmsMap)
+            axis equal tight
+            idx = m_rmsMap>0;
+            set(gca,'clim',[min(m_rmsMap(idx)),max(m_rmsMap(idx))])
+            ylabel(colorbar,sprintf('WFE [10^-%dm]',obj.unit))
+            title(sprintf('(WFE: %4.2f) ',obj.rms))
+        end
+        
+        function phase = mtimes(obj,data)
+            % * Matrix multilplication
+            %
+            % out = obj*data multilplies the data by the linear MMSE
+            % estimator matrix; data is a NxMxnStar map whith N and M equal
+            % to obj.sampling and nStar equal to obj.nGuideStar; the output
+            % is a NxMxobj.nMmseStar array
+            
+            [n,m,nData] = size(data);
+            % Check if data is sampled according to the reconstructor
+            % sampling
+            if n~=obj.sampling
+                % Interpolate data on the reconstructor grid
+                obj.resolution = n;
+                phase = data;
+                data = zeros(obj.sampling,obj.sampling,nData);
+                phase(phase==0) = NaN;
+                [x,y] = meshgrid( linspace(-1,1,n)*obj.diameter/2 );
+                xyi = linspace(-1,1,obj.sampling)*obj.diameter/2;
+                for kData = 1:nData
+                    data(:,:,kData) = interp2(x,y,phase(:,:,kData),xyi,xyi');
+                end
+                data(isnan(data)) = 0;
+            end
+            
+            data = reshape( data, obj.sampling^2 , nData);
+            data = data(obj.pupil,:);
+            data = data(:);
+            phase = zeros(obj.sampling);
+            
+            if obj.resolution==obj.sampling
+                out   = zeros(n,m,obj.nMmseStar);
+                for kMmseStar=1:obj.nMmseStar
+                    phase(obj.pupil) = obj.mmseBuilder{kMmseStar}*data;
+                    out(:,:,kMmseStar) = phase;
+                end
+            else
+                out   = zeros(obj.resolution,obj.resolution,obj.nMmseStar);
+                [x,y] = meshgrid( linspace(-1,1,obj.sampling)*obj.diameter/2 );
+                xyi = linspace(-1,1,obj.resolution)*obj.diameter/2;
+                for kMmseStar=1:obj.nMmseStar
+                    phase(obj.pupil) = obj.mmseBuilder{kMmseStar}*data;
+                    phase(~obj.pupil) = NaN;
+                    phase = interp2(x,y,phase,xyi,xyi');
+                    phase(isnan(phase)) = 0;
+                    out(:,:,kMmseStar) = phase;
+                end
+            end
+        end
     end
        
     
@@ -657,17 +717,27 @@ classdef linearMMSE < handle
             %% SOLVEMMSE
             
             fprintf(' -->> mmse solver!\n')
-            m_mmseBuilder = cell(obj.nmmseStar,1);
+            m_mmseBuilder = cell(obj.nMmseStar,1);
             m_Cox = obj.Cox;
             m_Cxx = obj.Cxx;
 %             Is = 1e6*speye(size(obj.P,1));
             m_noiseCovariance = obj.p_noiseCovariance;
-            for k=1:obj.nmmseStar
+            for k=1:obj.nMmseStar
                 m_mmseBuilder{k} = m_Cox{k}/(m_Cxx+m_noiseCovariance);
             end
             obj.mmseBuilder = m_mmseBuilder;
             obj.Bmse = [];
             obj.p_otf = [];
+        end
+        
+        function spaceJump(obj)
+            fprintf(' -->> Space jump!\n')
+            %                 obj.covarianceSafe = { obj.Cxx , obj.Cox , obj.CoxLag };
+            obj.Cxx = obj.p_P*obj.Cxx*obj.p_P';
+            obj.Cox = cellfun( @(x) x*obj.p_P', obj.Cox , 'UniformOutput', false);
+            if obj.lag>0
+                obj.CoxLag = cellfun( @(x) x*obj.p_P', obj.CoxLag , 'UniformOutput', false);
+            end
         end
         
     end
